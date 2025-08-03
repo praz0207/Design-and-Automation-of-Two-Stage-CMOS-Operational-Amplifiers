@@ -1,2 +1,3 @@
 # Design-and-Automation-of-Two-Stage-CMOS-Operational-Amplifiers
-This projects aim to automate the design process of a two stage CMOS op amp using a Python program with focuses on finding the aspect ratios of various transistors and then optimizing the design according to the user specifications and design requirements.
+This projects aim to automate the design process of a two stage CMOS op amp using a Python program which focuses on finding the aspect ratios of various transistors and then optimizing the design according to the user specifications and design requirements.
+The project was undertaken during my summer research fellowship at IIT Madras during summer 2025 under the guidance of Prof. Sankaran Anirrudhan.
