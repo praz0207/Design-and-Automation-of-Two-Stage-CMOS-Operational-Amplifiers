@@ -1,0 +1,568 @@
+import os
+import subprocess
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from datetime import datetime
+
+specs = {
+    'power_budget': float(input("Enter total power budget (W): ")),
+    'gain_db': float(input("Enter desired gain (dB): ")),
+    'ocmr_min': float(input("Enter OCMR min (V): ")),
+    'ocmr_max': float(input("Enter OCMR max (V): ")),
+    'icmr_min': float(input("Enter ICMR min (V): ")),
+    'icmr_max': float(input("Enter ICMR max (V): ")),
+    'ugb': float(input("Enter unity-gain bandwidth (Hz): ")),
+    'phase_margin': float(input("Enter desired phase margin (degrees): "))
+}
+
+uncox = 230.76e-6
+upcox = 97.433e-6
+vt_n = 0.36624
+vt_p = -0.3906012
+vdd = 1.8
+Lmin = 0.18e-6
+max_iterations = 100
+
+iteration = 1
+L_vals = {k: Lmin for k in ['M1','M2','M3','M4','M5','M6','M7','M0']}
+fixed_Cc = None
+
+def extract_gm1_from_log(log_path):
+    with open(log_path, 'r') as log_file:
+        for line in log_file:
+            if 'm1[gm]' in line.lower():
+                parts = line.strip().split()
+                for part in parts:
+                    try:
+                        return float(part)
+                    except ValueError:
+                        continue
+    return None
+
+def parse_gds(log_path):
+    gds = {}
+    with open(log_path, 'r') as file:
+        for line in file:
+            line = line.strip().lower()
+            if line.startswith('@m') and '[gds]' in line:
+                try:
+                    parts = line.split()
+                    transistor = parts[0].split('[')[0][1:].upper()
+                    value = float(parts[-1])
+                    gds[transistor] = value
+                except:
+                    continue
+    return gds
+
+def parse_node_voltages_raw(log_path):
+    node_voltages = {}
+    with open(log_path, 'r') as file:
+        for line in file:
+            line = line.strip().lower()
+            if line.startswith("v(") and "=" in line:
+                try:
+                    parts = line.split("=")
+                    node = parts[0].strip()[2:-1].upper()  # e.g., v(N001) → N001
+                    value = float(parts[1].strip())
+                    node_voltages[node] = value
+                except:
+                    continue
+    return node_voltages
+
+def parse_gm(log_path):
+    gm_values = {}
+    with open(log_path, 'r') as file:
+        for line in file:
+            line = line.strip().lower()
+            if line.startswith("@m") and "[gm]" in line and "=" in line:
+                try:
+                    parts = line.split("=")
+                    key = parts[0].strip()     # e.g., @m1[gm]
+                    transistor = key.split('[')[0][1:].upper()  # M1
+                    value = float(parts[1].strip())
+                    gm_values[transistor] = value
+                except:
+                    continue
+    return gm_values
+
+
+while iteration <= max_iterations:
+    print(f"\n===== Iteration {iteration} =====")
+    Itotal = specs['power_budget'] / vdd
+    I0 = Itotal / 10
+    I5 = 9* I0
+    I6 = I5
+
+    vdsat5 = specs['ocmr_min']
+    WL5 = (2 * I5) / (uncox * vdsat5 ** 2)
+    if WL5 < 1.5:
+        WL5=1.5
+    else:
+        pass
+    WL0 = (I0 / I5) * WL5
+    if WL0 < 1.5 :
+        WL0=1.5
+        WL5=(I5/I0)*1.5
+    else:
+        pass
+    vdsat6 = vdd - specs['ocmr_max']
+    WL6 = (2 * I6) / (upcox * vdsat6 ** 2)
+    if WL6 < 1.5:
+        WL6=1.5
+    else:
+        pass
+    WL34 = (WL6 * (I0 / 2)) / I6
+    if WL34 < 1.5:
+        WL34=1.5
+        WL6=(I6/(I0/2))*1.5
+    else:
+        pass
+    vgs_min = specs['icmr_min'] - vdsat5
+    WL12 = (2 * (I0 / 2)) / (uncox * (vgs_min - vt_n) ** 2)
+    if WL12 < 1.5:
+        WL12=1.5
+    else:
+        pass
+    def width(wl, Lval):
+        result = round(wl * Lval * 1e6, 2)
+        return result
+
+    W1 = width(WL12, L_vals['M1']); W2 = width(WL12, L_vals['M2'])
+    W0 = width(WL0, L_vals['M0']);   W7 = width(WL0, L_vals['M7'])
+    W5 = width(WL5, L_vals['M5'])
+    W3 = width(WL34, L_vals['M3']); W4 = width(WL34, L_vals['M4'])
+    W6 = width(WL6, L_vals['M6'])
+
+    netlist_path = r"C:\\Users\\Prajwal Ka College\\ngspice\\Spice64\\bin\\New1.cir"
+    with open(netlist_path, 'r') as file:
+        netlist = file.readlines()
+
+    updated_netlist = []
+    in_control_block = False
+
+    for line in netlist:
+        stripped = line.strip()
+        if stripped.startswith('.control'):
+            in_control_block = True
+            continue
+        if in_control_block and stripped.startswith('.endc'):
+            in_control_block = False
+            continue
+        if in_control_block:
+            continue
+
+        if stripped.startswith('M1'):
+            updated_netlist.append(f"M1 N001 N003 N006 0 CMOSN l={L_vals['M1']*1e6:.2f}u w={W1}u\n")
+        elif stripped.startswith('M2'):
+            updated_netlist.append(f"M2 N002 N004 N006 0 CMOSN l={L_vals['M2']*1e6:.2f}u w={W2}u\n")
+        elif stripped.startswith('M0') or stripped.startswith('MO'):
+            updated_netlist.append(f"M0 N006 N005 0 0 CMOSN l={L_vals['M0']*1e6:.2f}u w={W0}u\n")
+        elif stripped.startswith('M7'):
+            updated_netlist.append(f"M7 N005 N005 0 0 CMOSN l={L_vals['M7']*1e6:.2f}u w={W7}u\n")
+        elif stripped.startswith('M5'):
+            updated_netlist.append(f"M5 VOUT N005 0 0 CMOSN l={L_vals['M5']*1e6:.2f}u w={W5}u\n")
+        elif stripped.startswith('M3'):
+            updated_netlist.append(f"M3 N001 N001 VDD VDD CMOSP l={L_vals['M3']*1e6:.2f}u w={W3}u\n")
+        elif stripped.startswith('M4'):
+            updated_netlist.append(f"M4 N002 N001 VDD VDD CMOSP l={L_vals['M4']*1e6:.2f}u w={W4}u\n")
+        elif stripped.startswith('M6'):
+            updated_netlist.append(f"M6 VOUT N002 VDD VDD CMOSP l={L_vals['M6']*1e6:.2f}u w={W6}u\n")
+        elif stripped.startswith('C1'):
+            if fixed_Cc is not None:
+                Cc_pf = fixed_Cc*1e12
+                updated_netlist.append(f"C1 VOUT N002 {Cc_pf:.6f}p\n")
+            else:
+                updated_netlist.append(line)
+        elif stripped.startswith('I1'):
+            updated_netlist.append(f"I1 VDD N005 {I0}\n")
+        else:
+            updated_netlist.append(line)
+
+    control_block = [
+        ".control\n",
+        "ac dec 100 0.1 100MEG\n" if iteration == 1 else "ac dec 500 0.1 100MEG\n",
+        "set units=d\n",
+        "print @m1[gm]\n" if iteration == 1 else "",
+        "wrdata ac_data.txt frequency vdb(VOUT) phase(VOUT)\n",
+        "print @m1[gds] @m2[gds] @m3[gds] @m4[gds] @m5[gds] @m6[gds] @m0[gds] @m7[gds]\n",
+        "print @m1[gm] @m2[gm] @m3[gm] @m4[gm] @m5[gm] @m6[gm] @m0[gm] @m7[gm]\n"
+        "op\n",
+        "print v(N001) v(N002) v(N003) v(N004) v(N005) v(N006) v(VOUT) v(VDD)\n",
+        "quit\n",
+        ".endc\n"
+    ]
+
+    end_index = next((i for i, line in enumerate(updated_netlist) if line.strip() == '.end'), None)
+    if end_index is not None:
+        updated_netlist = updated_netlist[:end_index] + control_block + updated_netlist[end_index:]
+    else:
+        updated_netlist.extend(control_block + [".end\n"])
+
+    updated_path = r"C:\\Users\\Prajwal Ka College\\ngspice\\Spice64\\bin\\Updated1.cir"
+    with open(updated_path, 'w') as file:
+        file.writelines(updated_netlist)
+
+    os.chdir(os.path.dirname(updated_path))
+    result = subprocess.run([
+        r'C:\\Users\\Prajwal Ka College\\ngspice\\Spice64\\bin\\ngspice.exe',
+        '-b', '-o', 'ngspice_output.log', updated_path
+    ], capture_output=True, text=True)
+
+    if result.returncode != 0:
+        print(f"NGSPICE error:\n{result.stderr}")
+        break
+
+
+    gm_dict = parse_gm("ngspice_output.log")
+    print("Extracted GM values:")
+    for t, gm in gm_dict.items():
+        print(f"{t}: gm = {gm:.4e} S")
+    
+
+    # Parse and print node voltages
+    node_voltages = parse_node_voltages_raw("ngspice_output.log")
+
+    print("Extracted Node Voltages:")
+    for node, voltage in node_voltages.items():
+        print(f"{node}: {voltage:.4f} V")
+    
+    
+    # Extract node voltages for M0
+    vg = node_voltages.get("N005", None)
+    vs = 0
+    vd = node_voltages.get("N006", None)
+
+    if None not in (vg, vs, vd):
+        vgs = vg - vs
+        vds = vd - vs
+        print(f"M0: VGS = {vgs:.4f} V, VDS = {vds:.4f} V, VTH = {vt_n:.4f} V")
+        if vgs < vt_n:
+            print("M0 is in Cutoff region.")
+        elif vds > (vgs - vt_n):
+            print("M0 is in Saturation region.")
+        else:
+            print("M0 is in Triode region.")
+    else:
+        print("Missing node voltage(s) for M0.")
+
+
+    # Extract node voltages for M1
+    vg = node_voltages.get("N003", None)
+    vs = node_voltages.get("N006", None)
+    vd = node_voltages.get("N001", None)
+
+    if None not in (vg, vs, vd):
+        vgs = vg - vs
+        vds = vd - vs
+        print(f"M1: VGS = {vgs:.4f} V, VDS = {vds:.4f} V, VTH = {vt_n:.4f} V")
+        if vgs < vt_n:
+            print("M1 is in Cutoff region.")
+        elif vds > (vgs - vt_n):
+            print("M1 is in Saturation region.")
+        else:
+            print("M1 is in Triode region.")
+    else:
+        print("Missing node voltage(s) for M1.")
+
+    # Extract node voltages for M2
+    vg = node_voltages.get("N004", None)
+    vs = node_voltages.get("N006", None)
+    vd = node_voltages.get("N004", None)
+
+    if None not in (vg, vs, vd):
+        vgs = vg - vs
+        vds = vd - vs
+        print(f"M2: VGS = {vgs:.4f} V, VDS = {vds:.4f} V, VTH = {vt_n:.4f} V")
+        if vgs < vt_n:
+            print("M2 is in Cutoff region.")
+        elif vds > (vgs - vt_n):
+            print("M2 is in Saturation region.")
+        else:
+            print("M2 is in Triode region.")
+    else:
+        print("Missing node voltage(s) for M2.")
+
+    # Extract node voltages for M3
+    vg = node_voltages.get("N001", None)
+    vs = node_voltages.get("VDD", None)
+    vd = node_voltages.get("N001", None)
+
+    if None not in (vg, vs, vd):
+        vsg = vs - vg
+        vsd = vs - vd
+        vt_pm=(-1)*(vt_p)
+        print(f"M3: VSG = {vsg:.4f} V, VSD = {vsd:.4f} V, VTH = {vt_pm:.4f} V")
+        if vsg < vt_pm:
+            print("M3 is in Cutoff region.")
+        elif vsd > (vsg - vt_pm):
+            print("M3 is in Saturation region.")
+        else:
+            print("M3 is in Triode region.")
+    else:
+        print("Missing node voltage(s) for M3.")
+    
+    # Extract node voltages for M4
+    vg = node_voltages.get("N001", None)
+    vs = node_voltages.get("VDD", None)
+    vd = node_voltages.get("N002", None)
+
+    if None not in (vg, vs, vd):
+        vsg = vs - vg
+        vsd = vs - vd
+        vt_pm=(-1)*(vt_p)
+        print(f"M4: VSG = {vsg:.4f} V, VSD = {vsd:.4f} V, VTH = {vt_pm:.4f} V")
+        if vsg < vt_pm:
+            print("M4 is in Cutoff region.")
+        elif vsd > (vsg - vt_pm):
+            print("M4 is in Saturation region.")
+        else:
+            print("M4 is in Triode region.")
+    else:
+        print("Missing node voltage(s) for M4.")
+
+    # Extract node voltages for M5
+    vg = node_voltages.get("N005", None)
+    vs = 0
+    vd = node_voltages.get("VOUT", None)
+
+    if None not in (vg, vs, vd):
+        vgs = vg - vs
+        vds = vd - vs
+        print(f"M5: VGS = {vgs:.4f} V, VDS = {vds:.4f} V, VTH = {vt_n:.4f} V")
+        if vgs < vt_n:
+            print("M5 is in Cutoff region.")
+        elif vds > (vgs - vt_n):
+            print("M5 is in Saturation region.")
+        else:
+            print("M5 is in Triode region.")
+    else:
+        print("Missing node voltage(s) for M5.")
+
+    # Extract node voltages for M6
+    vg = node_voltages.get("N002", None)
+    vs = node_voltages.get("VDD", None)
+    vd = node_voltages.get("VOUT", None)
+
+    if None not in (vg, vs, vd):
+        vsg = vs - vg
+        vsd = vs - vd
+        vt_pm=(-1)*(vt_p)
+        print(f"M6: VSG = {vsg:.4f} V, VSD = {vsd:.4f} V, VTH = {vt_pm:.4f} V")
+        if vsg < vt_pm:
+            print("M6 is in Cutoff region.")
+        elif vsd > (vsg - vt_pm):
+            print("M6 is in Saturation region.")
+        else:
+            print("M6 is in Triode region.")
+    else:
+        print("Missing node voltage(s) for M6.")
+
+    
+
+
+
+    gds = parse_gds("ngspice_output.log")
+    gds2 = gds.get('M2', 0)
+    gds4 = gds.get('M4', 0)
+    gds5 = gds.get('M5', 0)
+    gds6 = gds.get('M6', 0)
+    print("Extracted GDS values:")
+    print(gds)
+
+    # Ensure gds values exist before comparing
+    if all(k in gds for k in ['M2', 'M4', 'M5', 'M6']):
+        gds2 = gds['M2']
+        gds4 = gds['M4']
+        gds5 = gds['M5']
+        gds6 = gds['M6']
+
+        # Differential pair balance
+        if abs(gds4)>abs(gds2):
+                for m in ['M3', 'M4', 'M6']:
+                    L_vals[m] += Lmin
+                    print(f"Gds4 > Gds2, Updating L[{m}]")
+        else:
+                for m in ['M1', 'M2']:
+                    L_vals[m] += Lmin
+                    print(f"Gds2 > Gds4, Updating L[{m}]")
+                
+        if abs(gds5)>abs(gds6):
+            for m in ['M5','M7','M0']:
+                    L_vals[m] += Lmin
+                    print(f"Gds5 > Gds6, Updating L[{m}]")
+
+        else:
+                for m in ['M6','M3','M4']:
+                    L_vals[m] += Lmin
+                    print(f"Gds6 > Gds5, Updating L[{m}]")
+
+    else:
+        print("Warning: Some GDS values missing. Skipping L update this iteration.")
+
+
+    try:
+        data = pd.read_csv('ac_data.txt', delim_whitespace=True, header=None)
+        if data.shape[1] >= 3:
+            data = data.iloc[:, [0, -3, -1]]
+            data.columns = ['freq', 'gain_db', 'phase_deg']
+        else:
+            raise ValueError(f"Unexpected number of columns ({data.shape[1]}) in ac_data.txt")
+        
+        ugb, pm = None, None
+        for i in range(1, len(data)):
+            if data['gain_db'][i] <= 0 and data['gain_db'][i-1] > 0:
+                ugb = np.interp(0, [data['gain_db'][i-1], data['gain_db'][i]], [data['freq'][i-1], data['freq'][i]])
+                pm = np.interp(ugb, data['freq'], data['phase_deg']) + 180
+                break
+
+        if iteration == 1:
+            gm1 = extract_gm1_from_log("ngspice_output.log")
+            if gm1 is not None:
+                fixed_Cc = gm1 / (2 * np.pi * specs['ugb'])
+                print(f"gm1: {gm1:.2e}, Cc: {fixed_Cc:.2e} F")
+
+        gain = data['gain_db'][0]
+        print(f"DC Gain: {gain:.2f} dB")
+        if gain >= specs['gain_db'] and (pm is not None and pm >= specs['phase_margin']):
+            print("Target gain and phase margin achieved.")
+
+            # Plot and save results
+            plt.figure()
+            plt.semilogx(data['freq'], data['gain_db'], label='Gain (dB)', color='blue')
+            if ugb:
+                plt.axvline(ugb, color='red', linestyle='--', label=f'UGB = {ugb/1e6:.2f} MHz')
+                plt.annotate(f"PM = {pm:.1f}°", xy=(ugb, 0), xytext=(ugb*1.2, 10),
+                             arrowprops=dict(arrowstyle="->", color='green'),
+                             color='green')
+            plt.title('Gain vs Frequency')
+            plt.xlabel('Frequency (Hz)')
+            plt.ylabel('Gain (dB)')
+            plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig('gain_plot.png')
+            plt.close()
+
+            plt.figure()
+            plt.semilogx(data['freq'], data['phase_deg'], label='Phase (deg)', color='purple')
+            if ugb:
+                plt.axvline(ugb, color='red', linestyle='--', label=f'UGB = {ugb/1e6:.2f} MHz')
+            plt.title('Phase vs Frequency')
+            plt.xlabel('Frequency (Hz)')
+            plt.ylabel('Phase (Degrees)')
+            plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig('phase_plot.png')
+            plt.close()
+            break
+
+    except Exception as e:
+        print("Error processing output:", e)
+        break
+
+    iteration += 1
+else:
+    print("Max iterations reached without meeting specifications.")
+
+# Create a copy of the updated netlist for closed-loop modification
+closed_loop_netlist = updated_netlist.copy()
+
+# Remove existing control block (Control Block 1)
+in_control_block = False
+filtered_netlist = []
+for line in closed_loop_netlist:
+    stripped = line.strip()
+    if stripped.startswith('.control'):
+        in_control_block = True
+        continue
+    if in_control_block and stripped.startswith('.endc'):
+        in_control_block = False
+        continue
+    if not in_control_block:
+        filtered_netlist.append(line)
+closed_loop_netlist = filtered_netlist
+
+# Modify M1 connection to use VOUT as gate
+closed_loop_netlist = [
+    line.replace("M1 N001 N003", "M1 N001 VOUT") if line.startswith("M1") else line
+    for line in closed_loop_netlist
+]
+
+# Remove V2 and V3 lines if present
+closed_loop_netlist = [
+    line for line in closed_loop_netlist
+    if not line.startswith("V2 ") and not line.startswith("V3 ")
+]
+
+# Insert V3 and C2 before .end if present
+v3_line = "V3 N004 0 PULSE(0 1.5 0 1n 1n 110 111)\n"
+c2_line = "C2 VOUT 0 1p\n"
+end_index2 = next((i for i, line in enumerate(closed_loop_netlist) if line.strip() == '.end'), None)
+if end_index2 is not None:
+    closed_loop_netlist = closed_loop_netlist[:end_index2] + [v3_line, c2_line] + closed_loop_netlist[end_index2:]
+else:
+    closed_loop_netlist.extend([v3_line, c2_line])
+
+# Add transient analysis block
+control_block2 = [
+    ".control\n",
+    "tran 1n 5u 0\n",
+    "plot V(VOUT)\n",
+    "wrdata transient_output_cl.txt time V(VOUT)\n",
+    "quit\n",
+    ".endc\n"
+]
+
+# Insert control block before .end again in case end_index2 was used above 
+end_index2 = next((i for i, line in enumerate(closed_loop_netlist) if line.strip() == '.end'), None)
+if end_index2 is not None:
+    closed_loop_netlist = closed_loop_netlist[:end_index2] + control_block2 + closed_loop_netlist[end_index2:]
+else:
+    closed_loop_netlist.extend(control_block2 + [".end\n"])
+
+# Write to a separate netlist file
+closed_loop_path = r"C:\\Users\\Prajwal Ka College\\ngspice\\Spice64\\bin\\ClosedLoop.cir"
+with open(closed_loop_path, 'w') as file:
+    file.writelines(closed_loop_netlist)
+
+# Run simulation for closed-loop
+result2 = subprocess.run([
+    r'C:\\Users\\Prajwal Ka College\\ngspice\\Spice64\\bin\\ngspice.exe',
+    '-b', '-o', 'ngspice_output_cl.log', closed_loop_path
+], capture_output=True, text=True)
+
+# === Slew Rate Calculation for Closed-Loop ===
+if result2.returncode != 0:
+    print(f"NGSPICE error (closed-loop):\n{result2.stderr}")
+else:
+    try:
+        df_cl = pd.read_csv("transient_output_cl.txt", delim_whitespace=True, names=["time", "vout"])
+        df_cl = df_cl.sort_values(by="time").reset_index(drop=True)
+        idx1 = df_cl[df_cl['vout'] >= 0.15].index.min()
+        idx2 = df_cl[df_cl['vout'] >= 1.35].index.min()
+
+        if idx1 is not None and idx2 is not None and idx2 > idx1:
+            v1 = df_cl.loc[idx1, 'vout']
+            t1 = df_cl.loc[idx1, 'time']
+            v2 = df_cl.loc[idx2, 'vout']
+            t2 = df_cl.loc[idx2, 'time']
+            dV = v2 - v1
+            dT = t2 - t1
+            slew_rate_cl = dV / dT 
+            print(f"[Closed Loop] Slew Rate (Rising): {slew_rate_cl / 1e6:.2f} V/µs")
+        else:
+            print("Could not find valid voltage transition points for slew rate calculation.")
+
+        plt.plot(df_cl["time"] * 1e6, df_cl["vout"], label="VOUT (Closed Loop)")
+        plt.xlabel("Time (µs)")
+        plt.ylabel("Voltage (V)")
+        plt.title("Transient Response (Unity Gain Buffer)")
+        plt.grid(True)
+        plt.legend()
+        plt.savefig("transient_plot_closed_loop.png")
+        plt.close()
+    except Exception as e:
+        print("Error processing closed-loop transient output:", e)
+
